@@ -1,0 +1,64 @@
+
+      - name: 3. Install and Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "TAILSCALE_AUTHKEY secret is missing."
+          }
+
+          $msi = "$env:TEMP\tailscale.msi"
+          $log = "$env:TEMP\tailscale-install.log"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $msi
+
+          $proc = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /quiet /norestart /L*v `"$log`"" `
+            -Wait -PassThru
+
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            Get-Content $log -Tail 60
+            throw "Tailscale installation failed: $($proc.ExitCode)"
+          }
+
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $exe)) {
+            throw "tailscale.exe was not found after installation."
+          }
+
+          $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+
+          if (!$svc) {
+            throw "Tailscale service was not found."
+          }
+
+          if ($svc.Status -ne "Running") {
+            Start-Service Tailscale
+          }
+
+          Start-Sleep -Seconds 5
+
+          & $exe up "--authkey=$env:TAILSCALE_AUTHKEY" "--hostname=github-rdp-server"
+
+          if ($LASTEXITCODE -ne 0) {
+            & $exe status
+            throw "Tailscale connection failed."
+          }
+
+          Start-Sleep -Seconds 5
+
+          $ts_ip = (& $exe ip -4 | Select-Object -First 1).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($ts_ip)) {
+            & $exe status
+            throw "Tailscale did not assign an IPv4 address."
+          }
+
+          Write-Host "Tailscale connected successfully."
+          Write-Host "Tailscale IP: $ts_ip"
