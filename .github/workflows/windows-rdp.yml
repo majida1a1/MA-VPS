@@ -1,117 +1,181 @@
 
-- name: 3. Install and Connect Tailscale
-  shell: pwsh
-  timeout-minutes: 5
-  env:
-    TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-  run: |
-    $ErrorActionPreference = "Stop"
+name: Windows Cloud RDP #2
 
-    $msi = "$env:TEMP\tailscale.msi"
-    $log = "$env:TEMP\tailscale-install.log"
-    $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+on:
+  workflow_dispatch:
 
-    try {
-      if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-        throw "Missing GitHub secret: TAILSCALE_AUTHKEY"
-      }
+permissions:
+  contents: read
 
-      Write-Host "STEP 1: Checking network access..."
-      Test-NetConnection pkgs.tailscale.com -Port 443 |
-        Format-List ComputerName, RemotePort, TcpTestSucceeded
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 350
 
-      Write-Host "STEP 2: Downloading Tailscale MSI..."
-      Invoke-WebRequest `
-        -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-        -OutFile $msi `
-        -TimeoutSec 90
+    steps:
+      - name: 1. Install and Connect Tailscale
+        shell: pwsh
+        timeout-minutes: 5
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
 
-      if (!(Test-Path $msi)) {
-        throw "MSI download did not produce a file."
-      }
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "TAILSCALE_AUTHKEY secret is missing."
+          }
 
-      Write-Host "STEP 3: Installing Tailscale..."
-      $proc = Start-Process msiexec.exe `
-        -ArgumentList "/i `"$msi`" /quiet /norestart /L*v `"$log`"" `
-        -Wait -PassThru
+          $msi = "$env:TEMP\tailscale.msi"
+          $log = "$env:TEMP\tailscale-install.log"
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-      if ($proc.ExitCode -notin @(0, 3010)) {
-        if (Test-Path $log) {
-          Get-Content $log -Tail 50
-        }
-        throw "MSI installation failed. Exit code: $($proc.ExitCode)"
-      }
+          Write-Host "Downloading Tailscale..."
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $msi `
+            -TimeoutSec 90
 
-      if (!(Test-Path $exe)) {
-        throw "tailscale.exe not found at expected path: $exe"
-      }
+          Write-Host "Installing Tailscale..."
+          $proc = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /quiet /norestart /L*v `"$log`"" `
+            -Wait -PassThru
 
-      Write-Host "STEP 4: Starting Tailscale service..."
-      $svc = Get-Service Tailscale -ErrorAction Stop
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            if (Test-Path $log) {
+              Get-Content $log -Tail 40
+            }
+            throw "Tailscale MSI installation failed: $($proc.ExitCode)"
+          }
 
-      if ($svc.Status -ne "Running") {
-        Start-Service Tailscale
-      }
+          if (!(Test-Path $exe)) {
+            throw "tailscale.exe not found."
+          }
 
-      $deadline = (Get-Date).AddSeconds(45)
-      do {
-        Start-Sleep -Seconds 2
-        $svc = Get-Service Tailscale
-      } while ($svc.Status -ne "Running" -and
-               (Get-Date) -lt $deadline)
+          $svc = Get-Service Tailscale -ErrorAction Stop
+          if ($svc.Status -ne "Running") {
+            Start-Service Tailscale
+          }
 
-      if ($svc.Status -ne "Running") {
-        throw "Tailscale service failed to start."
-      }
+          $deadline = (Get-Date).AddSeconds(45)
+          do {
+            Start-Sleep -Seconds 2
+            $svc = Get-Service Tailscale
+          } while ($svc.Status -ne "Running" -and
+                   (Get-Date) -lt $deadline)
 
-      Write-Host "STEP 5: Connecting to Tailscale..."
-      & $exe up `
-        "--auth-key=$env:TAILSCALE_AUTHKEY" `
-        "--hostname=github-rdp-server" `
-        "--timeout=45s"
+          if ($svc.Status -ne "Running") {
+            throw "Tailscale service failed to start."
+          }
 
-      $upExit = $LASTEXITCODE
+          Write-Host "Connecting to Tailscale..."
+          & $exe up `
+            "--auth-key=$env:TAILSCALE_AUTHKEY" `
+            "--hostname=github-rdp-server" `
+            "--timeout=45s" `
+            "--unattended"
 
-      if ($upExit -ne 0) {
-        & $exe status
-        throw "tailscale up failed. Exit code: $upExit"
-      }
+          if ($LASTEXITCODE -ne 0) {
+            & $exe status
+            throw "Tailscale connection failed."
+          }
 
-      Write-Host "STEP 6: Verifying connection..."
-      & $exe status
-      if ($LASTEXITCODE -ne 0) {
-        throw "Tailscale status command failed."
-      }
+          $ip = & $exe ip -4
+          if ($LASTEXITCODE -ne 0 -or !$ip) {
+            throw "Could not obtain Tailscale IPv4 address."
+          }
 
-      $ipOutput = & $exe ip -4
-      $ipExit = $LASTEXITCODE
+          $ip = ($ip | Select-Object -First 1).Trim()
+          Write-Host "Tailscale connected: $ip"
 
-      if ($ipExit -ne 0) {
-        throw "Unable to query Tailscale IPv4 address."
-      }
+      - name: 2. Enable Secure RDP
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
 
-      $ts_ip = $ipOutput |
-        Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
-        Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD) -or
+              $env:RDP_PASSWORD.Length -lt 16) {
+            throw "Set RDP_PASSWORD to a strong password of at least 16 characters."
+          }
 
-      if (!$ts_ip) {
-        throw "No Tailscale IPv4 address was assigned."
-      }
+          $account = Get-LocalUser -Name "runneradmin" `
+            -ErrorAction SilentlyContinue
 
-      Write-Host "SUCCESS: Tailscale connected."
-      Write-Host "Tailscale IP: $ts_ip"
-    }
-    catch {
-      Write-Host "::error::Tailscale setup failed: $($_.Exception.Message)"
+          if (!$account) {
+            throw "Expected Windows account runneradmin was not found."
+          }
 
-      Write-Host "Diagnostic: Windows service status"
-      Get-Service Tailscale -ErrorAction SilentlyContinue |
-        Format-List Name, Status, StartType
+          Write-Host "Setting RDP account password..."
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
 
-      if (Test-Path $log) {
-        Write-Host "Last MSI installer log entries:"
-        Get-Content $log -Tail 30
-      }
+          Set-LocalUser -Name "runneradmin" -Password $securePassword
 
-      throw
-    }
+          Write-Host "Enabling Remote Desktop..."
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" -Value 1
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service TermService
+
+          # Disable broad built-in RDP rules, then allow RDP
+          # only from Tailscale IPv4 addresses.
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          if (!(Get-NetFirewallRule -DisplayName "RDP over Tailscale only" `
+                -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule `
+              -DisplayName "RDP over Tailscale only" `
+              -Direction Inbound `
+              -Action Allow `
+              -Protocol TCP `
+              -LocalPort 3389 `
+              -RemoteAddress "100.64.0.0/10" `
+              -Profile Any
+          }
+
+          Write-Host "RDP enabled with Network Level Authentication."
+          Write-Host "Firewall allows RDP only from Tailscale IPv4 peers."
+
+      - name: 3. Show Connection Details
+        shell: pwsh
+        timeout-minutes: 1
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          $ip = & $exe ip -4
+          if ($LASTEXITCODE -ne 0 -or !$ip) {
+            throw "Unable to retrieve Tailscale IP."
+          }
+
+          $ip = ($ip | Select-Object -First 1).Trim()
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "RDP IS READY"
+          Write-Host "Computer : $ip"
+          Write-Host "Username : runneradmin"
+          Write-Host "Password : GitHub Secret RDP_PASSWORD"
+          Write-Host "Port     : 3389"
+          Write-Host "========================================"
+          Write-Host ""
+          & $exe status
+
+      - name: 4. Keep RDP Available
+        shell: pwsh
+        timeout-minutes: 340
+        run: |
+          Write-Host "RDP is available while this job is running."
+          while ($true) {
+            Start-Sleep -Seconds 60
+          }
